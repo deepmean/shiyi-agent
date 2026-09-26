@@ -1,5 +1,11 @@
 # 更新日志
 
+## [未发布] 修复中转通道「思考回传」400
+
+- 门控修正：中转通道（非官方端点、非内网直连）一律给**全部** assistant 消息补非空思考占位，chat / responses / anthropic 三条通道规则统一。
+- 重试兜底：`must be passed back` 类 400 重试 2 次；`/v1/responses` 返回 404 时重试 1 次（中转多节点轮询，同一 body 有时 200 有时 400）。
+- 实测依据：真实 200 条历史重放，只给带工具调用的 assistant 补占位 → 400 `content[].thinking must be passed back`；补全部 → 200。
+
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
 ## [未发布] 修复工具调用序列断裂导致的 400 + WorkBuddy 身份预设

@@ -285,6 +285,8 @@ class LlmClient {
       var sendStore = _isResponses;
       var sendParallel = tools.isNotEmpty;
       var sendInclude = _isResponses;
+      var thinkingEchoRetries = 0;
+      var responses404Retries = 0;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
@@ -420,6 +422,21 @@ class LlmClient {
             if (outputLimit > 8192 && _isMaxTokensParamError(err)) {
               outputLimit = 8192;
               onDiag?.call('[stream] max_tokens 过大被拒绝，降级 8192 重试');
+              continue;
+            }
+            // 思考回传类 400：中转多节点轮询，只有部分节点严格校验，
+            // 重试一两次常能落到宽松节点（实测同一 body 有时 200 有时 400）。
+            if (_isThinkingEchoRequired(err) && thinkingEchoRetries < 2) {
+              thinkingEchoRetries++;
+              onDiag?.call('[stream] 思考回传被拒，重试（节点抖动）');
+              continue;
+            }
+            // Responses 端点在部分中转上只有少数节点实现：404 重试一次。
+            if (_isResponses &&
+                response.statusCode == 404 &&
+                responses404Retries < 1) {
+              responses404Retries++;
+              onDiag?.call('[stream] /v1/responses 返回 404，重试（节点抖动）');
               continue;
             }
             throw LlmHttpException(
@@ -659,6 +676,7 @@ class LlmClient {
       split.messages.map(_withoutResponsesOnlyFields).toList(),
       forceReasoning:
           ReasoningModels.usesDeepSeekThinkingParam(model) ||
+          _isRelayChannel ||
           split.messages.any(
             (m) =>
                 m['role'] == 'assistant' &&
@@ -753,7 +771,10 @@ class LlmClient {
   }) {
     final split = _splitSystems(messages);
     final effortField = _openAiReasoningEffort(reasoningEffort);
-    final input = _toResponsesInput(split.messages, forceReasoning: thinkingEnabled);
+    final input = _toResponsesInput(
+      split.messages,
+      forceReasoning: thinkingEnabled || _isRelayChannel,
+    );
     if (split.tail.trim().isNotEmpty) {
       input.add({'type': 'message', 'role': 'system', 'content': split.tail});
     }
@@ -1199,7 +1220,9 @@ class LlmClient {
         if (reasoning.isNotEmpty) {
           content.add({'type': 'thinking', 'thinking': reasoning});
         } else if (fabricate &&
-            (forceReasoning || _hasAnyReasoning(messages))) {
+            (forceReasoning ||
+                _hasAnyReasoning(messages) ||
+                _isRelayChannel)) {
           content.add({'type': 'thinking', 'thinking': _reasoningPlaceholder});
         }
         content.add({'type': 'text', 'text': (m['content'] ?? '').toString()});
@@ -1221,6 +1244,35 @@ class LlmClient {
         (m['role'] ?? '').toString() == 'assistant' &&
         (m['reasoning_content'] ?? '').toString().trim().isNotEmpty,
   );
+
+  /// 中转通道（非官方端点、非内网直连）会把 OpenAI 请求翻成 Anthropic 格式，
+  /// 并在历史处于思考模式时要求**每条** assistant 消息都带思考内容。
+  /// 实测（真实 200 条历史重放）：只给带工具调用的 assistant 补占位 →
+  /// 400 `content[].thinking must be passed back`；给全部 assistant 补占位
+  /// → 200。官方端点与内网直连不伪造，避免签名校验/未知字段报错。
+  bool get _isRelayChannel {
+    final host = (Uri.tryParse(baseUrl)?.host ?? '').toLowerCase();
+    if (host.isEmpty) return false;
+    if (host.contains('openai.com') ||
+        host.contains('anthropic.com') ||
+        host.contains('deepseek.com')) {
+      return false;
+    }
+    if (host == 'localhost' || host == '127.0.0.1' || host == '::1') {
+      return false;
+    }
+    if (host.startsWith('192.168.') ||
+        host.startsWith('10.') ||
+        host.startsWith('169.254.')) {
+      return false;
+    }
+    final priv = RegExp(r'^172\.(\d+)\.').firstMatch(host);
+    if (priv != null) {
+      final second = int.tryParse(priv.group(1) ?? '') ?? 0;
+      if (second >= 16 && second <= 31) return false;
+    }
+    return true;
+  }
 
   /// 修复工具调用序列，保证发给上游的 messages 满足两条硬约束：
   /// 1) 每条 `assistant(tool_calls)` 后面紧跟响应其每个 `tool_call_id` 的
@@ -1438,6 +1490,14 @@ class LlmClient {
   /// 推送 reasoning_content；OpenAI 风格模型仍只使用 reasoning_effort。
   static bool usesDeepSeekThinkingParam(String model) =>
       ReasoningModels.usesDeepSeekThinkingParam(model);
+
+  /// 思考回传类 400：上游要求把历史里的思考内容原样带回，缺了直接拒。
+  static bool _isThinkingEchoRequired(String err) {
+    final e = err.toLowerCase();
+    return e.contains('must be passed back') ||
+        e.contains('reasoning_text') ||
+        e.contains('reasoning_content');
+  }
 
   /// 判断 HTTP 400 是否由 max_tokens 参数过大/不被支持引起。
   static bool _isMaxTokensParamError(String err) {
