@@ -583,6 +583,9 @@ class LlmClient {
     bool sendParallel = false,
     bool sendInclude = false,
   }) {
+    // 历史里可能存在「连续 assistant(tool_calls)」「孤儿/乱序工具结果」
+    // 「工具结果被压缩掉」等形态，上游会直接 400。发送前统一修复。
+    messages = _repairToolSequence(messages);
     if (protocol == 'anthropic') {
       return _buildAnthropicBody(
         messages: messages,
@@ -1195,7 +1198,8 @@ class LlmClient {
         final content = <Map<String, dynamic>>[];
         if (reasoning.isNotEmpty) {
           content.add({'type': 'thinking', 'thinking': reasoning});
-        } else if (forceReasoning && fabricate) {
+        } else if (fabricate &&
+            (forceReasoning || _hasAnyReasoning(messages))) {
           content.add({'type': 'thinking', 'thinking': _reasoningPlaceholder});
         }
         content.add({'type': 'text', 'text': (m['content'] ?? '').toString()});
@@ -1206,6 +1210,131 @@ class LlmClient {
     }
     flushToolResults();
     return _mergeAdjacentRoles(out);
+  }
+
+  /// 工具结果在历史压缩或中断中丢失时的占位内容。
+  static const String _toolResultGonePlaceholder = '（该工具结果已在历史压缩或中断中移除）';
+
+  /// 历史里是否已有思考内容（判断这段会话是否处于思考模式）。
+  static bool _hasAnyReasoning(List<Map<String, dynamic>> messages) => messages.any(
+    (m) =>
+        (m['role'] ?? '').toString() == 'assistant' &&
+        (m['reasoning_content'] ?? '').toString().trim().isNotEmpty,
+  );
+
+  /// 修复工具调用序列，保证发给上游的 messages 满足两条硬约束：
+  /// 1) 每条 `assistant(tool_calls)` 后面紧跟响应其每个 `tool_call_id` 的
+  ///    `tool` 消息；
+  /// 2) 不存在无前置 `tool_calls` 的孤儿工具结果（含乱序、重复）。
+  ///
+  /// 实测（真实 219 条历史重放，中转通道）：修复前 400
+  /// `unexpected tool_use_id ... in tool_result blocks` /
+  /// `An assistant message with 'tool_calls' must be followed by tool messages`；
+  /// 修复后 200。
+  static List<Map<String, dynamic>> _repairToolSequence(
+    List<Map<String, dynamic>> messages,
+  ) {
+    // 1) 合并连续同角色消息：assistant 的 tool_calls / 正文 / 思考合并到一条，
+    //    user 的正文拼接（归档确认、失败占位这类合成消息会连成同角色）。
+    final merged = <Map<String, dynamic>>[];
+    for (final raw in messages) {
+      final m = Map<String, dynamic>.from(raw);
+      final role = (m['role'] ?? '').toString();
+      if (merged.isNotEmpty && (merged.last['role'] ?? '').toString() == role) {
+        final prev = merged.last;
+        if (role == 'assistant') {
+          final tcs = m['tool_calls'];
+          if (tcs is List && tcs.isNotEmpty) {
+            final cur = prev['tool_calls'];
+            prev['tool_calls'] = [
+              if (cur is List) ...cur,
+              ...tcs,
+            ];
+          }
+          final text = (m['content'] ?? '').toString();
+          if (text.trim().isNotEmpty) {
+            final prevText = (prev['content'] ?? '').toString();
+            prev['content'] = prevText.isEmpty ? text : '$prevText\n$text';
+          }
+          if ((prev['reasoning_content'] ?? '').toString().trim().isEmpty &&
+              (m['reasoning_content'] ?? '').toString().trim().isNotEmpty) {
+            prev['reasoning_content'] = m['reasoning_content'];
+          }
+          if ((prev['reasoning_encrypted'] ?? '').toString().trim().isEmpty &&
+              (m['reasoning_encrypted'] ?? '').toString().trim().isNotEmpty) {
+            prev['reasoning_encrypted'] = m['reasoning_encrypted'];
+          }
+        } else if (role == 'user') {
+          final text = (m['content'] ?? '').toString();
+          if (text.trim().isNotEmpty) {
+            final prevText = (prev['content'] ?? '').toString();
+            prev['content'] = prevText.isEmpty ? text : '$prevText\n$text';
+          }
+        } else {
+          merged.add(m);
+        }
+      } else {
+        merged.add(m);
+      }
+    }
+
+    // 2) 工具结果严格跟随其 assistant(tool_calls)：缺失补占位，孤儿丢弃。
+    final out = <Map<String, dynamic>>[];
+    var i = 0;
+    while (i < merged.length) {
+      final m = merged[i];
+      final role = (m['role'] ?? '').toString();
+      if (role == 'assistant') {
+        final tcs = m['tool_calls'];
+        if (tcs is List && tcs.isNotEmpty) {
+          final ids = <String>[];
+          final normalized = <Map<String, dynamic>>[];
+          for (final t in tcs) {
+            if (t is! Map) continue;
+            final tc = Map<String, dynamic>.from(t);
+            var id = (tc['id'] ?? '').toString();
+            if (id.isEmpty) {
+              id = 'call_${out.length}_${normalized.length}';
+              tc['id'] = id;
+            }
+            if (ids.contains(id)) continue;
+            ids.add(id);
+            normalized.add(tc);
+          }
+          m['tool_calls'] = normalized;
+          out.add(m);
+          i++;
+          final got = <String, Map<String, dynamic>>{};
+          while (i < merged.length &&
+              (merged[i]['role'] ?? '').toString() == 'tool') {
+            final cid = (merged[i]['tool_call_id'] ?? '').toString();
+            if (ids.contains(cid) && !got.containsKey(cid)) {
+              got[cid] = merged[i];
+            }
+            i++;
+          }
+          for (final id in ids) {
+            out.add(
+              got[id] ??
+                  <String, dynamic>{
+                    'role': 'tool',
+                    'tool_call_id': id,
+                    'content': _toolResultGonePlaceholder,
+                  },
+            );
+          }
+          continue;
+        }
+      }
+      if (role == 'tool') {
+        // 孤儿工具结果：前置 assistant(tool_calls) 已不在历史里。
+        i++;
+        continue;
+      }
+      out.add(m);
+      i++;
+    }
+    return out;
   }
 
   /// Anthropic 要求 user / assistant 交替；历史里出现连续同角色消息

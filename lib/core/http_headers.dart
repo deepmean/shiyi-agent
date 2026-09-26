@@ -6,6 +6,9 @@
 ///   （agent/codex_headers.py、tests/agent/test_provider_attribution_headers.py）
 /// - Codex CLI：openai/codex（codex-rs，originator=codex_cli_rs、version、session_id）
 /// - Claude Code：claude-cli/<版本> (external, cli) + x-app: cli 等公开抓包资料
+/// - WorkBuddy：腾讯 WorkBuddy（CodeBuddy 系），取自
+///   PrasomTR/Workbuddy-codebuddy-openai-proxy 的 internal/upstream/headers.go
+///   （UA 三段式 WorkBuddy/<版本> CLI/<版本>、X-CodeBuddy-Request 等）
 ///
 /// 版本号只是示例值，网关若按版本放行，请按需改成真实客户端版本。
 library;
@@ -72,6 +75,24 @@ const List<HttpHeaderPreset> httpHeaderPresets = [
       'x-stainless-retry-count': '0',
       'x-stainless-timeout': '600',
       'X-Claude-Code-Session-Id': '{{uuid}}',
+    },
+  ),
+  HttpHeaderPreset(
+    id: 'workbuddy',
+    name: 'WorkBuddy',
+    subtitle: 'WorkBuddy/<版本> CLI/<版本> + X-CodeBuddy-Request',
+    headers: {
+      'User-Agent': 'WorkBuddy/1.0.0 CLI/2.137.1',
+      'X-CodeBuddy-Request': '1',
+      'X-Product': 'SaaS',
+      'X-Agent-Purpose': 'conversation',
+      'X-IDE-Name': 'WorkBuddy',
+      'X-IDE-Type': 'WorkBuddy',
+      'X-IDE-Version': '1.0.0',
+      'X-Domain': 'www.workbuddy.ai',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Request-ID': '{{uuid}}',
+      'X-Conversation-ID': '{{session_id}}',
     },
   ),
 ];

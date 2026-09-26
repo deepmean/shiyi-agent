@@ -2,6 +2,35 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [未发布] 修复工具调用序列断裂导致的 400 + WorkBuddy 身份预设
+
+### 修复
+
+- `llm_client.dart` 新增 `_repairToolSequence`，在所有协议组装请求体前统一修复工具调用序列。用真实会话历史（219 条窗口）重放中转通道，复现出三种畸形形态：
+  - **连续两条 `assistant(tool_calls)`**：上一轮 assistant 消息后没有紧跟工具结果，报
+    `An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`；
+  - **孤儿工具结果**：`tool` 消息的 `tool_call_id` 在历史里找不到对应 `tool_calls`（被窗口裁剪或压缩掉），报
+    `unexpected tool_use_id ... in tool_result blocks`；
+  - **乱序 / 重复工具结果**。
+  修复动作：合并连续同角色消息（assistant 的 `tool_calls` / 正文 / 思考合并，user 正文拼接）→ 工具结果严格跟随其 `assistant(tool_calls)`（按 `tool_call_id` 顺序输出，缺失补占位）→ 丢弃孤儿工具结果。
+- 实测：同一份真实历史，修复前 400，修复后 200（219 条与 150 条窗口各验证一次）。
+- `_toAnthropicMessages`：中转通道且历史处于思考模式时，**普通 assistant 消息**也补 `thinking` 块（此前只补带工具调用的），覆盖 `content[].thinking must be passed back`。
+
+### 新增
+
+- `http_headers.dart`：新增 **WorkBuddy**（腾讯 WorkBuddy / CodeBuddy 系）身份预设，取值来自
+  `PrasomTR/Workbuddy-codebuddy-openai-proxy` 的 `internal/upstream/headers.go`：
+  UA 三段式 `WorkBuddy/<版本> CLI/<版本>`、`X-CodeBuddy-Request: 1`、`X-Product: SaaS`、
+  `X-Agent-Purpose: conversation`、`X-IDE-Name/Type/Version`、`X-Domain: www.workbuddy.ai` 等。
+  版本号为示例值，网关若按版本放行需自行覆盖。
+
+### 验证（真实会话历史重放，中转通道）
+
+| 窗口 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 219 条（线上失败请求同规模） | 400 `unexpected tool_use_id` | **200** |
+| 150 条 | 400 工具轮断裂 | **200** |
+
 ## [未发布] 修复 Anthropic Messages / Responses 通道 400
 
 ### 修复
