@@ -3695,6 +3695,7 @@ class ShiyiState extends ChangeNotifier {
       maxTokens: settings.maxOutputTokens,
       tools: _activeToolsFor(planMode: run.planMode),
       customHeaders: clientSettings.effectiveCustomHeaders,
+      stream: clientSettings.streamEnabled,
       reasoningEffortOverride: run.thinkingOn ? run.reasoningEffort : 'off',
       shouldStop: () => run.stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
@@ -4759,6 +4760,7 @@ class ShiyiState extends ChangeNotifier {
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
           customHeaders: clientSettings.effectiveCustomHeaders,
+          stream: clientSettings.streamEnabled,
           toolsJson: _toolsJsonFor(def.allowedTools),
           // 子代理上下文预算：主会话 contextLimit 的 75%（留出输出与工具定义空间）。
           contextBudgetTokens: parentLimit > 0 ? (parentLimit * 3) ~/ 4 : 0,

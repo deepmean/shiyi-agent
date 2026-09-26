@@ -281,6 +281,9 @@ class SubagentRunner {
   /// 自定义 / 伪装请求头，与主会话保持一致。
   final Map<String, String> customHeaders;
 
+  /// 是否流式请求（跟随主会话的「流式」开关）。
+  final bool stream;
+
   /// 执行工具的回调（复用主循环的 _executeTool）。
   final Future<String> Function(String name, String argsJson) executeTool;
 
@@ -334,6 +337,7 @@ class SubagentRunner {
     this.maxTokens = 8192,
     required this.toolsJson,
     this.customHeaders = const {},
+    this.stream = true,
     required this.executeTool,
     required this.workingDir,
     this.shouldStop,
@@ -527,6 +531,7 @@ class SubagentRunner {
       maxTokens: maxTokens,
       tools: toolsJson,
       customHeaders: customHeaders,
+      stream: stream,
       shouldStop: shouldStop,
       onTurn: (t) {
         accumulated = t;

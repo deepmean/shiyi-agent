@@ -1004,6 +1004,70 @@ class ThinkingToggleButton extends StatelessWidget {
   }
 }
 
+/// 流式输出开关（ChatBox 风格胶囊）：开启时高亮，关闭时灰显整段返回。
+class StreamToggleButton extends StatelessWidget {
+  final bool on;
+  final VoidCallback? onPressed;
+
+  const StreamToggleButton({
+    super.key,
+    required this.on,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final enabled = onPressed != null;
+    final fg = !enabled
+        ? theme.disabledColor
+        : on
+        ? _iosBlue
+        : theme.colorScheme.onSurfaceVariant;
+    return Tooltip(
+      message: on ? '流式输出已开启（逐字刷新）' : '流式输出已关闭（整段返回）',
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: enabled ? onPressed : null,
+        child: Container(
+          height: 28,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            color: on
+                ? _iosBlue.withValues(alpha: 0.14)
+                : theme.colorScheme.onSurface.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: on
+                  ? _iosBlue.withValues(alpha: 0.45)
+                  : theme.dividerColor.withValues(alpha: 0.35),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                on ? CupertinoIcons.bolt_fill : CupertinoIcons.bolt,
+                size: 13,
+                color: fg,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                '流式',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: fg,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 会话级模型配置选项。只负责展示，不持有引擎或密钥。
 class SessionModelOption {
   final String value;
@@ -1912,6 +1976,10 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final bool thinkingEnabled;
   final bool thinkingOn;
   final ValueChanged<bool>? onThinkingToggled;
+
+  /// 流式输出开关（ChatBox 风格胶囊按钮）。
+  final bool streamOn;
+  final ValueChanged<bool>? onStreamToggled;
   final VoidCallback? onCompress;
   final bool compressBusy;
   final VoidCallback? onContextLimit;
@@ -1952,6 +2020,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.thinkingEnabled = true,
     this.thinkingOn = true,
     this.onThinkingToggled,
+    this.streamOn = true,
+    this.onStreamToggled,
     this.onCompress,
     this.compressBusy = false,
     this.onContextLimit,
@@ -2033,6 +2103,7 @@ class LiquidGlassChatComposer extends StatelessWidget {
                 if ((modelOptions.isNotEmpty && onModelChanged != null) ||
                     (thinkingOptions.isNotEmpty && onThinkingChanged != null) ||
                     onThinkingToggled != null ||
+                    onStreamToggled != null ||
                     onCompress != null ||
                     onContextLimit != null ||
                     (permissionOptions.isNotEmpty &&
@@ -2087,6 +2158,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
                               ? () => onThinkingToggled!(!thinkingOn)
                               : null,
                         ),
+                        if (onStreamToggled != null)
+                          StreamToggleButton(
+                            on: streamOn,
+                            onPressed: () => onStreamToggled!(!streamOn),
+                          ),
                       if (thinkingOptions.isNotEmpty &&
                           onThinkingChanged != null)
                         ThinkingIntensitySelector(

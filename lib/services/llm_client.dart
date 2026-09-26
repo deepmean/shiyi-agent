@@ -69,6 +69,9 @@ class LlmClient {
   /// 同名覆盖默认头，Content-Type 除外；值支持 {{session_id}} / {{uuid}}。
   final Map<String, String> customHeaders;
 
+  /// 是否使用流式（SSE）传输。false = 非流式整段返回（设置页「流式」开关）。
+  final bool stream;
+
   /// 拾忆主会话的显式思考强度；null 表示沿用模型默认推断。
   /// 该字段不承载 DSH 的会话模型协议。
   final String? reasoningEffortOverride;
@@ -127,6 +130,7 @@ class LlmClient {
     this.reasoningEffortOverride,
     this.onDiag,
     this.customHeaders = const {},
+    this.stream = true,
   });
 
   bool get _isResponses => protocol == 'responses';
@@ -254,7 +258,8 @@ class LlmClient {
     _activeHttpClient = client;
     try {
       _throwIfCancelled();
-      var includeUsage = true;
+      // 非流式请求不支持 stream_options，不能带 include_usage。
+      var includeUsage = stream;
       // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级到 8192 重试。
       var outputLimit = maxTokens;
       // 明显思考型模型默认请求思考输出；网关拒绝 thinking / reasoning_effort
@@ -287,7 +292,7 @@ class LlmClient {
         _throwIfCancelled();
         final body = _buildRequestBody(
           messages: [...messages, ...continuation],
-          stream: true,
+          stream: stream,
           includeUsage: includeUsage,
           maxTokens: outputLimit,
           thinkingEnabled: thinkingEnabled,
@@ -298,10 +303,10 @@ class LlmClient {
           sendInclude: sendInclude,
         );
         final request = http.Request('POST', Uri.parse(_endpoint))
-          ..headers.addAll(_headers(streaming: true))
+          ..headers.addAll(_headers(streaming: stream))
           ..body = jsonEncode(body);
         onDiag?.call(
-          '[stream] request model=$model '
+          '${stream ? '[stream]' : '[nostream]'} request model=$model '
           'thinking=${thinkingEnabled ? 'on' : 'off'} '
           'reasoningEffort=${reasoningEffort ?? 'off'} '
           'tokenField=${useMaxCompletion ? 'max_completion_tokens' : 'max_tokens'}',
@@ -325,7 +330,7 @@ class LlmClient {
                 'model': model,
                 'endpoint': _safeEndpoint(_endpoint),
                 'round': round + 1,
-                'stream': true,
+                'stream': stream,
                 'bytes': utf8.encode(bodyPreview).length,
                 'messages': messages.length,
                 'tools': tools.length,
@@ -337,9 +342,15 @@ class LlmClient {
         }
         try {
           _throwIfCancelled();
+          // 非流式要等上游把整段回复生成完，超时放宽到 10 分钟；
+          // 流式只需等响应头，保持 60 秒。
           final response = await client
               .send(request)
-              .timeout(const Duration(seconds: 60));
+              .timeout(
+                stream
+                    ? const Duration(seconds: 60)
+                    : const Duration(minutes: 10),
+              );
           _throwIfCancelled();
           if (response.statusCode != 200) {
             final err = await response.stream.bytesToString();
@@ -365,32 +376,6 @@ class LlmClient {
             );
             // 思考参数被网关拒绝：先分别去掉不兼容字段重试。
             final e = err.toLowerCase();
-            // DeepSeek V4 思考模式强制校验（官方 thinking_mode 文档）：
-            // 会话里模型一旦发生过工具调用，后续请求必须回传历史 assistant
-            // 消息的 reasoning_content，否则整轮 400。历史里只要混入了没有
-            // 思考内容的助手消息（压缩摘要、失败占位、其他厂商模型产生的
-            // 轮次），就无法凭空补出思考内容，只能按官方备选方案关闭思考。
-            // 这里一次性关掉 thinking 与 reasoning_effort，避免两轮才降完；
-            // 关思考后仍报同样错误说明历史确实缺思考内容，直接给出可操作
-            // 提示，而不是把一段英文 400 原样抛给用户。
-            if (_isThinkingEchoRequired(err)) {
-              if (thinkingEnabled ||
-                  (reasoningEffort != null && reasoningEffort != 'off')) {
-                thinkingEnabled = false;
-                reasoningEffort = null;
-                onDiag?.call('[stream] 网关要求回传思考内容，关闭思考模式后重试');
-                continue;
-              }
-              throw LlmHttpException(
-                LlmErrorInfo.fromHttp(response.statusCode, err).withHint(
-                  '该网关启用了思考模式强制校验：模型发生过工具调用的会话，'
-                  '后续请求必须回传历史中的思考内容，而当前历史里有缺少'
-                  '思考内容的助手消息（摘要、占位或中途换过模型）。'
-                  '请新建会话重试，或把思考强度设为「关闭」。',
-                ),
-                err,
-              );
-            }
             if (useMaxCompletion && e.contains('max_completion_tokens')) {
               useMaxCompletion = false;
               onDiag?.call('[stream] max_completion_tokens 被拒绝，回退 max_tokens');
@@ -442,7 +427,9 @@ class LlmClient {
               err,
             );
           }
-          final needContinue = protocol == 'anthropic'
+          final needContinue = !stream
+              ? await _parseNonStreamBody(response)
+              : protocol == 'anthropic'
               ? await _parseAnthropicSse(response.stream)
               : _isResponses
               ? await _parseResponsesSse(response.stream)
@@ -1081,16 +1068,12 @@ class LlmClient {
     for (final m in messages) {
       final role = m['role'];
       if (role == 'tool') {
-        final toolUseId = (m['tool_call_id'] ?? '').toString();
-        // tool_call_id 为空的历史脏数据无法配对，直接丢弃该结果块，
-        // 否则上游报 unexpected tool_result。
-        if (toolUseId.isEmpty) continue;
         out.add({
           'role': 'user',
           'content': [
             {
               'type': 'tool_result',
-              'tool_use_id': toolUseId,
+              'tool_use_id': (m['tool_call_id'] ?? '').toString(),
               'content': (m['content'] ?? '').toString(),
             },
           ],
@@ -1109,107 +1092,19 @@ class LlmClient {
           final fn = tc['function'] is Map<String, dynamic>
               ? tc['function'] as Map<String, dynamic>
               : <String, dynamic>{};
-          final id = (tc['id'] ?? '').toString();
-          // 空 id 的 tool_use 无法与任何 tool_result 配对，跳过而不是
-          // 下发一个必然被拒的块。
-          if (id.isEmpty) continue;
           content.add({
             'type': 'tool_use',
-            'id': id,
+            'id': (tc['id'] ?? '').toString(),
             'name': (fn['name'] ?? '').toString(),
             'input': _decodeArguments(fn['arguments']),
           });
         }
-        if (content.isEmpty) continue;
         out.add({'role': 'assistant', 'content': content});
         continue;
       }
       out.add({'role': role, 'content': (m['content'] ?? '').toString()});
     }
-    return _repairAnthropicToolPairs(out);
-  }
-
-  /// Anthropic 对工具配对有硬校验：每个 tool_use 之后必须紧跟包含对应
-  /// tool_result 的消息，否则整轮 400（`messages.N: tool_use ids were found
-  /// without tool_result blocks immediately after`）。历史压缩、工具结果被
-  /// 裁掉、续写中断都会造成断链；这里补齐缺失的 tool_result 占位，并丢弃
-  /// 已经没有对应 tool_use 的孤儿结果块。
-  static List<Map<String, dynamic>> _repairAnthropicToolPairs(
-    List<Map<String, dynamic>> messages,
-  ) {
-    final out = <Map<String, dynamic>>[];
-    final knownToolUseIds = <String>{};
-    for (var i = 0; i < messages.length; i++) {
-      final m = messages[i];
-      final resultIds = _toolResultIdsOf(m);
-      if (resultIds.isNotEmpty) {
-        final kept = resultIds.where(knownToolUseIds.contains).toSet();
-        if (kept.isEmpty) continue;
-        if (kept.length == resultIds.length) {
-          out.add(m);
-        } else {
-          out.add({
-            'role': 'user',
-            'content': [
-              for (final b in (m['content'] as List))
-                if (b is Map &&
-                    b['type'] == 'tool_result' &&
-                    kept.contains((b['tool_use_id'] ?? '').toString()))
-                  b,
-            ],
-          });
-        }
-        continue;
-      }
-      out.add(m);
-      final toolUseIds = _toolUseIdsOf(m);
-      if (toolUseIds.isEmpty) continue;
-      knownToolUseIds.addAll(toolUseIds);
-      final answered = <String>{};
-      var j = i + 1;
-      while (j < messages.length) {
-        final next = _toolResultIdsOf(messages[j]);
-        if (next.isEmpty) break;
-        answered.addAll(next);
-        j++;
-      }
-      final missing = toolUseIds
-          .where((id) => !answered.contains(id))
-          .toList(growable: false);
-      if (missing.isEmpty) continue;
-      out.add({
-        'role': 'user',
-        'content': [
-          for (final id in missing)
-            {
-              'type': 'tool_result',
-              'tool_use_id': id,
-              'content': '[工具结果缺失：该结果在历史压缩或中断中已被移除]',
-              'is_error': true,
-            },
-        ],
-      });
-    }
     return out;
-  }
-
-  static List<String> _toolUseIdsOf(Map<String, dynamic> m) {
-    final content = m['content'];
-    if (m['role'] != 'assistant' || content is! List) return const <String>[];
-    return [
-      for (final b in content)
-        if (b is Map && b['type'] == 'tool_use') (b['id'] ?? '').toString(),
-    ];
-  }
-
-  static List<String> _toolResultIdsOf(Map<String, dynamic> m) {
-    final content = m['content'];
-    if (m['role'] != 'user' || content is! List) return const <String>[];
-    return [
-      for (final b in content)
-        if (b is Map && b['type'] == 'tool_result')
-          (b['tool_use_id'] ?? '').toString(),
-    ];
   }
 
   Map<String, dynamic> _decodeArguments(Object? raw) {
@@ -1243,19 +1138,6 @@ class LlmClient {
 
   /// MiMo 等网关拒绝未知字段时只回 `Invalid request parameters`，
   /// 不点名 `reasoning_effort`。有思考档位时按该字段被拒处理。
-  /// 「思考内容必须回传」错误族：DeepSeek V4 思考模式下，模型一旦发生
-  /// 工具调用，后续请求必须携带历史 assistant 的 reasoning_content。
-  /// 三种协议的报错文案不同（openai 的 reasoning_content、responses 的
-  /// reasoning_text、anthropic 的 content[].thinking），判定统一走这里。
-  static bool _isThinkingEchoRequired(String err) {
-    final e = err.toLowerCase();
-    if (!e.contains('must be passed back')) return false;
-    return e.contains('reasoning_content') ||
-        e.contains('reasoning_text') ||
-        e.contains('thinking') ||
-        e.contains('reasoning');
-  }
-
   static bool _isVagueInvalidRequest(String err) {
     final e = err.toLowerCase();
     return e.contains('invalid request parameters') ||
@@ -1488,6 +1370,265 @@ class LlmClient {
 
   /// OpenAI / DeepSeek / 百炼 / OpenRouter Responses SSE。
   /// DeepSeek 在 response.completed 结束，没有 data: [DONE]。
+  /// 非流式响应体解析：把整段 JSON 转成 [TurnResult]，语义与流式路径一致
+  /// （返回 true 表示纯文本被截断、调用方应追加「继续」再请求一次）。
+  Future<bool> _parseNonStreamBody(http.StreamedResponse response) async {
+    final raw = await response.stream.bytesToString();
+    _throwIfCancelled();
+    if (raw.trim().isEmpty) {
+      throw LlmInterruptedException('上游返回了空响应体（非流式）');
+    }
+    final Map<String, dynamic> body;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('响应体不是 JSON 对象');
+      }
+      body = decoded;
+    } catch (_) {
+      throw LlmInterruptedException('上游返回了非 JSON 响应（非流式）：${_short(raw)}');
+    }
+    final err = body['error'];
+    if (err != null) {
+      throw LlmHttpException(
+        LlmErrorInfo.fromHttp(response.statusCode, jsonEncode(err)),
+        raw,
+      );
+    }
+    return protocol == 'anthropic'
+        ? _applyNonStreamAnthropic(body)
+        : _isResponses
+        ? _applyNonStreamResponses(body)
+        : _applyNonStreamOpenAi(body);
+  }
+
+  /// Chat Completions 非流式：`choices[0].message`。
+  bool _applyNonStreamOpenAi(Map<String, dynamic> body) {
+    final usage = body['usage'];
+    if (usage is Map) applyUsage(Map<String, dynamic>.from(usage));
+    final choices = body['choices'];
+    final choice =
+        (choices is List && choices.isNotEmpty && choices.first is Map)
+        ? Map<String, dynamic>.from(choices.first as Map)
+        : <String, dynamic>{};
+    final rawMsg = choice['message'];
+    final msg = rawMsg is Map
+        ? Map<String, dynamic>.from(rawMsg)
+        : <String, dynamic>{};
+    final text = _contentText(msg['content']);
+    final reasoning = (msg['reasoning_content'] ?? msg['reasoning'] ?? '')
+        .toString();
+    final encrypted = (msg['reasoning_encrypted'] ?? '').toString();
+    final calls = <Map<String, String>>[];
+    final rawCalls = msg['tool_calls'];
+    if (rawCalls is List) {
+      for (final c in rawCalls) {
+        if (c is! Map) continue;
+        final fn = c['function'];
+        final f = fn is Map ? Map<String, dynamic>.from(fn) : <String, dynamic>{};
+        final id = (c['id'] ?? '').toString();
+        final name = (f['name'] ?? '').toString();
+        if (id.isEmpty || name.isEmpty) continue;
+        calls.add({
+          'id': id,
+          'name': name,
+          'arguments': (f['arguments'] ?? '').toString(),
+        });
+      }
+    }
+    _lastRoundText = text;
+    _lastRoundReasoning = reasoning;
+    _lastRoundReasoningEncrypted = encrypted;
+    onTurn?.call(
+      TurnResult(
+        text: text,
+        reasoning: reasoning,
+        reasoningEncrypted: encrypted,
+        toolCalls: calls,
+      ),
+    );
+    return _decideNonStreamContinue(
+      text: text,
+      reasoning: reasoning,
+      toolCalls: calls,
+      truncated: (choice['finish_reason'] ?? '').toString() == 'length',
+    );
+  }
+
+  /// Responses 非流式：`output[]`（reasoning / message / function_call）。
+  bool _applyNonStreamResponses(Map<String, dynamic> body) {
+    final usage = body['usage'];
+    if (usage is Map) applyUsage(Map<String, dynamic>.from(usage));
+    final text = StringBuffer();
+    final reasoning = StringBuffer();
+    var encrypted = '';
+    final calls = <Map<String, String>>[];
+    final output = body['output'];
+    if (output is List) {
+      for (final item in output) {
+        if (item is! Map) continue;
+        final type = (item['type'] ?? '').toString();
+        if (type == 'reasoning') {
+          for (final key in const ['summary', 'content']) {
+            final parts = item[key];
+            if (parts is List) {
+              for (final part in parts) {
+                if (part is Map && part['text'] != null) {
+                  reasoning.write(part['text'].toString());
+                }
+              }
+            }
+          }
+          final enc = (item['encrypted_content'] ?? '').toString();
+          if (enc.isNotEmpty) encrypted = enc;
+        } else if (type == 'message') {
+          final parts = item['content'];
+          if (parts is List) {
+            for (final part in parts) {
+              if (part is Map && part['text'] != null) {
+                text.write(part['text'].toString());
+              }
+            }
+          }
+        } else if (type == 'function_call') {
+          final id = (item['call_id'] ?? item['id'] ?? '').toString();
+          final name = (item['name'] ?? '').toString();
+          if (id.isEmpty || name.isEmpty) continue;
+          calls.add({
+            'id': id,
+            'name': name,
+            'arguments': (item['arguments'] ?? '').toString(),
+          });
+        }
+      }
+    }
+    if (text.isEmpty && body['output_text'] is String) {
+      text.write(body['output_text'] as String);
+    }
+    final t = text.toString();
+    final r = reasoning.toString();
+    _lastRoundText = t;
+    _lastRoundReasoning = r;
+    _lastRoundReasoningEncrypted = encrypted;
+    onTurn?.call(
+      TurnResult(
+        text: t,
+        reasoning: r,
+        reasoningEncrypted: encrypted,
+        toolCalls: calls,
+      ),
+    );
+    final incomplete = body['incomplete_details'];
+    final reason = incomplete is Map
+        ? (incomplete['reason'] ?? '').toString()
+        : '';
+    final truncated =
+        (body['status'] ?? '').toString() == 'incomplete' &&
+        (reason.isEmpty || reason.contains('max_output_tokens'));
+    return _decideNonStreamContinue(
+      text: t,
+      reasoning: r,
+      toolCalls: calls,
+      truncated: truncated,
+    );
+  }
+
+  /// Anthropic Messages 非流式：`content[]`（text / thinking / tool_use）。
+  bool _applyNonStreamAnthropic(Map<String, dynamic> body) {
+    final usage = body['usage'];
+    if (usage is Map) applyUsage(Map<String, dynamic>.from(usage));
+    final text = StringBuffer();
+    final reasoning = StringBuffer();
+    final calls = <Map<String, String>>[];
+    final content = body['content'];
+    if (content is List) {
+      for (final block in content) {
+        if (block is! Map) continue;
+        final type = (block['type'] ?? '').toString();
+        if (type == 'text') {
+          text.write((block['text'] ?? '').toString());
+        } else if (type == 'thinking' || type == 'redacted_thinking') {
+          reasoning.write((block['thinking'] ?? '').toString());
+        } else if (type == 'tool_use') {
+          final id = (block['id'] ?? '').toString();
+          final name = (block['name'] ?? '').toString();
+          if (id.isEmpty || name.isEmpty) continue;
+          final input = block['input'];
+          calls.add({
+            'id': id,
+            'name': name,
+            'arguments': input == null
+                ? '{}'
+                : (input is String ? input : jsonEncode(input)),
+          });
+        }
+      }
+    }
+    final t = text.toString();
+    final r = reasoning.toString();
+    _lastRoundText = t;
+    _lastRoundReasoning = r;
+    _lastRoundReasoningEncrypted = '';
+    onTurn?.call(TurnResult(text: t, reasoning: r, toolCalls: calls));
+    return _decideNonStreamContinue(
+      text: t,
+      reasoning: r,
+      toolCalls: calls,
+      truncated: (body['stop_reason'] ?? '').toString() == 'max_tokens',
+    );
+  }
+
+  /// 非流式的续写判定，与流式 `decideContinue` 同规则。
+  bool _decideNonStreamContinue({
+    required String text,
+    required String reasoning,
+    required List<Map<String, String>> toolCalls,
+    required bool truncated,
+  }) {
+    final t = text.trim();
+    final halfCut =
+        reasoning.isNotEmpty &&
+        t.isNotEmpty &&
+        toolCalls.isEmpty &&
+        (t.endsWith('：') ||
+            t.endsWith(':') ||
+            t.endsWith('，') ||
+            t.endsWith(','));
+    if (!truncated && !halfCut) return false;
+    final toolsComplete =
+        toolCalls.isNotEmpty &&
+        toolCalls.every((c) {
+          final a = c['arguments'] ?? '';
+          return a.trim().isNotEmpty && _tryDecode(a) != null;
+        });
+    if (toolsComplete) return false;
+    if (toolCalls.isNotEmpty) {
+      throw LlmInterruptedException('工具调用被截断，交上层整轮重试');
+    }
+    if (t.isEmpty) {
+      throw LlmInterruptedException('回复中断：模型输出被截断且没有正文，交上层整轮重试');
+    }
+    return true;
+  }
+
+  /// 兼容 content 为字符串或分片数组（部分网关多模态返回数组）。
+  String _contentText(Object? content) {
+    if (content is String) return content;
+    if (content is List) {
+      final buf = StringBuffer();
+      for (final part in content) {
+        if (part is Map) {
+          final t = part['text'] ?? part['content'];
+          if (t != null) buf.write(t.toString());
+        } else if (part != null) {
+          buf.write(part.toString());
+        }
+      }
+      return buf.toString();
+    }
+    return content?.toString() ?? '';
+  }
+
   Future<bool> _parseResponsesSse(Stream<List<int>> raw) async {
     final lineBuffer = StringBuffer();
     String text = '';

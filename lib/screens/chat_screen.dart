@@ -1428,6 +1428,17 @@ class _ChatScreenState extends State<ChatScreen>
                                   return LiquidGlassChatComposer(
                                     input: _input,
                                     busy: _pageBusy,
+                                    streamOn:
+                                        widget.shiyi.settings.streamEnabled,
+                                    onStreamToggled: (v) {
+                                      unawaited(
+                                        widget.shiyi.updateSettings(
+                                          widget.shiyi.settings.copyWith(
+                                            streamEnabled: v,
+                                          ),
+                                        ),
+                                      );
+                                    },
                                     questionActive: _pageQuestion != null,
                                     allowSendWhileBusy: true,
                                     pendingImages: _pendingImages,

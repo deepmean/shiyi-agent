@@ -4,7 +4,7 @@
 
 ## [未发布]
 
-相对 2.6.6：模型 API 支持自定义 HTTP 请求头，并内置 Hermes Agent / Codex CLI / Claude Code 三套客户端身份预设。
+相对 2.6.6：模型 API 支持自定义 HTTP 请求头（内置 Hermes Agent / Codex CLI / Claude Code 三套客户端身份预设），对话界面新增「流式」开关。
 
 ### 新增
 
@@ -12,12 +12,7 @@
 - **占位符替换**：请求头的值支持 `{{session_id}}`（当前会话 ID）与 `{{uuid}}`（本客户端随机 UUID），发送时自动替换，便于模拟 Codex 的 `session_id` 与 Claude Code 的会话标识。
 - **覆盖规则**：自定义头同名覆盖预设与默认头，键名忽略大小写；值留空表示删除该头（例如去掉 `Accept`）；`Content-Type` 为协议关键头，不允许覆盖。设置页底部展示本次实际生效的请求头。
 - **生效范围**：拾忆普通会话、群聊、子代理、视觉描述、上下文压缩、记忆提炼，以及拉取模型列表、测试连接统一生效；配置随设置持久化。
-
-### 修复
-
-- **思考内容回传自动降级**：DeepSeek V4 思考模式要求「模型发生过工具调用的会话，后续请求必须回传历史 assistant 消息的思考内容」。历史里只要混入缺少思考内容的助手消息（上下文压缩摘要、失败占位、中途换过模型产生的轮次），上游就会整轮返回 HTTP 400（`reasoning_content` / `reasoning_text` / `content[].thinking` 三种文案）。现在命中该错误族时一次性关闭 `thinking` 与 `reasoning_effort` 后重试（原先要分两轮才降完）；若关闭思考后仍报同样错误，直接给出「新建会话 / 关闭思考强度」的可操作提示，不再把英文 400 原样抛出。
-- **Anthropic 工具配对修复**：Anthropic 硬校验每个 `tool_use` 之后必须紧跟对应的 `tool_result`，历史压缩、工具结果被裁掉或续写中断会造成断链，触发 `messages.N: tool_use ids were found without tool_result blocks immediately after`。现在发送前会补齐缺失的 `tool_result` 占位（标注为已丢失），并丢弃没有对应 `tool_use` 的孤儿结果块与空 ID 的工具块。
-- **错误提示增强**：`LlmErrorInfo` 支持附带中文可操作建议（`hint`），用于「参数本身合法但上游状态无法满足」这类报错。
+- **流式输出开关**：对话输入框上方的工具行新增 ChatBox 风格「流式」胶囊按钮，开启时逐字刷新，关闭时改用非流式整段返回（`stream: false`）。非流式路径完整支持 OpenAI Chat Completions、Responses、Anthropic Messages 三种协议，保留工具调用解析、token 统计与截断续写逻辑；开关随设置持久化，主会话与子代理共用。
 
 ### 说明
 
@@ -25,6 +20,7 @@
 - Hermes Agent、Codex CLI 的请求头取值来自各自官方开源仓库；Claude Code 为闭源客户端，其请求头取自公开抓包资料，可能随版本变化。
 - DSH 引擎自身发出的请求不经过该配置。
 - 使用伪装身份访问第三方服务可能违反其服务条款，风险由用户自行承担。
+- 关闭流式后首字延迟等于整段生成耗时，长回复期间界面无逐字反馈；只支持 SSE 的网关可能拒绝非流式请求。非流式请求超时放宽到 10 分钟。
 
 ### 验证
 

@@ -648,6 +648,9 @@ class AppSettings {
   /// 输入框按回车直接发送；关闭时回车换行。
   bool enterToSend;
 
+  /// 是否流式请求模型：true 逐字刷新，false 整段返回（对话界面可切换）。
+  bool streamEnabled;
+
   /// Windows 桌面终端后端：auto / wsl2 / gitbash / pwsh / cmd
   /// （Android 恒用内嵌 Alpine Linux，此设置不生效）。
   /// auto = WSL2 → Git Bash → PowerShell 7 → cmd。不走 Android proot。
@@ -751,6 +754,7 @@ class AppSettings {
     this.visionModel = '',
     this.enableNotifications = true,
     this.enterToSend = true,
+    this.streamEnabled = true,
     this.terminalBackend = 'auto',
     this.agentEngine = 'shiyi',
     this.dshAutoCheckUpdate = true,
@@ -806,6 +810,7 @@ class AppSettings {
     String? visionModel,
     bool? enableNotifications,
     bool? enterToSend,
+    bool? streamEnabled,
     String? terminalBackend,
     String? agentEngine,
     bool? dshAutoCheckUpdate,
@@ -860,6 +865,7 @@ class AppSettings {
     visionModel: visionModel ?? this.visionModel,
     enableNotifications: enableNotifications ?? this.enableNotifications,
     enterToSend: enterToSend ?? this.enterToSend,
+    streamEnabled: streamEnabled ?? this.streamEnabled,
     terminalBackend: terminalBackend ?? this.terminalBackend,
     agentEngine: agentEngine ?? this.agentEngine,
     dshAutoCheckUpdate: dshAutoCheckUpdate ?? this.dshAutoCheckUpdate,
@@ -918,6 +924,7 @@ class AppSettings {
     'visionModel': visionModel,
     'enableNotifications': enableNotifications,
     'enterToSend': enterToSend,
+    'streamEnabled': streamEnabled,
     'terminalBackend': terminalBackend,
     'agentEngine': agentEngine,
     'dshAutoCheckUpdate': dshAutoCheckUpdate,
@@ -972,6 +979,7 @@ class AppSettings {
     visionModel: j['visionModel'] ?? '',
     enableNotifications: j['enableNotifications'] ?? true,
     enterToSend: j['enterToSend'] ?? true,
+    streamEnabled: j['streamEnabled'] ?? true,
     terminalBackend: j['terminalBackend'] ?? 'auto',
     agentEngine: j['agentEngine'] ?? 'shiyi',
     dshAutoCheckUpdate: j['dshAutoCheckUpdate'] ?? true,
