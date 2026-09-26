@@ -894,16 +894,23 @@ class LlmClient {
     bool forceReasoning = false,
   }) {
     final enc = (message['reasoning_encrypted'] ?? '').toString().trim();
-    if (enc.isNotEmpty) {
-      input.add({'type': 'reasoning', 'encrypted_content': enc});
-      return;
-    }
-    if (baseUrl.contains('openai.com')) return;
     final text = (message['reasoning_content'] ?? '').toString().trim();
     final toolCalls = message['tool_calls'];
     final hasTools = toolCalls is List && toolCalls.isNotEmpty;
-    if (text.isEmpty && !hasTools && !forceReasoning) return;
-    final body = text.isEmpty ? _reasoningPlaceholder : text;
+    // 官方端点：有加密内容就原样回放；缺加密时不伪造条目，避免签名校验失败。
+    if (baseUrl.contains('openai.com')) {
+      if (enc.isNotEmpty) {
+        input.add({'type': 'reasoning', 'encrypted_content': enc});
+      }
+      return;
+    }
+    // 中转通道：严格节点要求每条 assistant 消息都带**明文** reasoning_text。
+    // 加密内容由宽松节点签发，回放到严格节点会校验失败（实测 400
+    // `The reasoning_text in the thinking mode must be passed back`），
+    // 因此中转通道只回放明文（真实思考文本，缺失时用占位）。
+    final needPlain = forceReasoning || hasTools || _isRelayChannel;
+    if (enc.isEmpty && !needPlain) return;
+    final body = text.isNotEmpty ? text : _reasoningPlaceholder;
     input.add({
       'type': 'reasoning',
       'summary': [
