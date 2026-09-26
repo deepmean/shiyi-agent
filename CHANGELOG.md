@@ -2,6 +2,23 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [未发布] 修复思考内容回传导致的 HTTP 400
+
+### 修复
+- `llm_client.dart`：`_withReasoningContentFallback` 补的思考占位由**空字符串**改为**非空占位文本** `（此轮思考内容未记录）`。
+  - 新增 `_needsReasoningPlaceholder`：带 `tool_calls` 的 assistant 消息一律补齐思考字段（上游硬性要求，与当前是否开启思考无关），其余 assistant 消息仅在开启思考回传时补。
+  - 原实现补空串，中转把 OpenAI 请求翻成 Anthropic 格式时会将空值丢弃，等价于没补 → 严格上游 100% 返回
+    `The content[].thinking in the thinking mode must be passed back to the API`。
+
+### 验证（真实中转通道，各 15 次请求）
+| 历史形态 | 200 | 400 |
+| --- | --- | --- |
+| 带工具调用的 assistant 无思考块 | 0 | 12（另 3 次上游 500） |
+| 空思考块 | 15 | 0 |
+| 占位思考块 | 15 | 0 |
+| 真实思考块 | 15 | 0 |
+
+
 ## [未发布]
 
 相对 2.6.6：模型 API 支持自定义 HTTP 请求头（内置 Hermes Agent / Codex CLI / Claude Code 三套客户端身份预设），对话界面新增「流式」开关。

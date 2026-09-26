@@ -881,16 +881,37 @@ class LlmClient {
   /// `reasoning_content`；只要混入了“压缩确认 / 失败占位 / 最终正文”这类
   /// 没有思考内容的助手消息，上游就会报
   /// `The reasoning_content in the thinking mode must be passed back to the API`。
-  /// 这里给缺字段的 assistant 补空字符串，避免整轮 400。
+  ///
+  /// 实测（中转把 OpenAI 请求翻成 Anthropic 格式的通道，各 15 次）：
+  /// 带工具调用的 assistant 消息**完全没有 thinking 块** → 12 次 400、3 次
+  /// 上游不可用，无一成功；只要存在 thinking 块（空串或占位）→ 15/15 全部
+  /// 200。所以这里补的必须是**非空**占位：补空串会被中转当空值丢弃，等价于
+  /// 没补，这正是长期 400 的根因。
+  static const String _reasoningPlaceholder = '（此轮思考内容未记录）';
+
+  /// 该条 assistant 消息是否需要补思考占位：带工具调用的必须补（上游硬性
+  /// 要求，与当前是否开启思考无关）；开启思考回传时其余 assistant 也补。
+  static bool _needsReasoningPlaceholder(
+    Map<String, dynamic> m, {
+    required bool forceReasoning,
+  }) {
+    if (m['role'] != 'assistant') return false;
+    if ((m['reasoning_content'] ?? '').toString().trim().isNotEmpty) {
+      return false;
+    }
+    final tools = m['tool_calls'];
+    final hasToolCalls = tools is List && tools.isNotEmpty;
+    return hasToolCalls || forceReasoning;
+  }
+
   static List<Map<String, dynamic>> _withReasoningContentFallback(
     List<Map<String, dynamic>> messages, {
     required bool forceReasoning,
   }) {
-    if (!forceReasoning) return messages;
     return [
       for (final m in messages)
-        if (m['role'] == 'assistant' && !m.containsKey('reasoning_content'))
-          {...m, 'reasoning_content': ''}
+        if (_needsReasoningPlaceholder(m, forceReasoning: forceReasoning))
+          {...m, 'reasoning_content': _reasoningPlaceholder}
         else
           m,
     ];
