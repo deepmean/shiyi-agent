@@ -71,3 +71,4 @@ android/build/
 
 # 维护日志仅本地保存，不随仓库发布
 /docs/fix-log.md
+keystore.p12
