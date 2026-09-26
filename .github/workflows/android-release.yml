@@ -1,0 +1,126 @@
+name: Android Release APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # 构建期一次性自签密码：keystore 只在 CI 内生成，用完即弃。
+      KEYSTORE_PASSWORD: shiyi-ci-2026
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.2"
+          channel: stable
+          cache: true
+
+      - name: Generate CI signing keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore keystore.jks \
+            -storetype JKS \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias shiyi \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEYSTORE_PASSWORD" \
+            -dname "CN=ShiYi Agent CI, OU=CI, O=ShiYi, L=NA, ST=NA, C=CN"
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Flutter analyze
+        continue-on-error: true
+        run: |
+          flutter analyze > analyze.log 2>&1 || true
+          tail -n 60 analyze.log > analyze_tail.txt || true
+
+      - name: Build release APK
+        run: |
+          set -o pipefail
+          if flutter build apk --release --target-platform android-arm64 2>&1 | tee build.log; then
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+          else
+            echo "== 首次构建失败，尝试按运行器已安装的 NDK 版本重试 ==" | tee -a build.log
+            NDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk"
+            ls "$NDK_DIR" >> build.log 2>&1 || true
+            NDK_VER=$(ls "$NDK_DIR" 2>/dev/null | tail -n 1 || true)
+            if [ -n "$NDK_VER" ]; then
+              sed -i "s|ndkVersion = flutter.ndkVersion|ndkVersion = \"$NDK_VER\"|" android/app/build.gradle.kts
+              flutter build apk --release --target-platform android-arm64 2>&1 | tee -a build.log && echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Collect build info
+        if: always()
+        run: |
+          FLUTTER_VER=$(flutter --version 2>/dev/null | head -n 1 || echo "Flutter 未安装")
+          {
+            echo "### 构建信息"
+            echo ""
+            echo "- 提交：\`${GITHUB_SHA}\`"
+            echo "- 分支：\`${GITHUB_REF_NAME}\`"
+            echo "- 工具链：${FLUTTER_VER}"
+            echo "- 构建结果：${BUILD_OK:+成功}${BUILD_OK:-失败}"
+            echo ""
+            echo "### flutter analyze"
+            echo ""
+            echo '```'
+            if [ -s analyze_tail.txt ]; then cat analyze_tail.txt; else echo "(无输出)"; fi
+            echo '```'
+            echo ""
+            echo "### build.log 尾部"
+            echo ""
+            echo '```'
+            if [ -s build.log ]; then tail -n 80 build.log; else echo "(无输出)"; fi
+            echo '```'
+          } > release_body.md
+
+      - name: Publish APK release
+        if: env.BUILD_OK == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.6.6-custom-headers
+          name: "ShiYi Agent 2.6.6 arm64-v8a（自定义 HTTP Header 构建）"
+          body_path: release_body.md
+          files: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish diagnostics on failure
+        if: env.BUILD_OK != '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-diagnostics
+          name: "CI 构建诊断（不是安装包）"
+          body_path: release_body.md
+          fail_on_unmatched_files: false
+          files: build.log
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiyi-agent-arm64-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: warn
