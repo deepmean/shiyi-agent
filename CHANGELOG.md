@@ -2,6 +2,37 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [未发布] 修复 Anthropic Messages / Responses 通道 400
+
+### 修复
+
+- `llm_client.dart` `_toAnthropicMessages`：**工具结果合并**。原先每个 `role: tool` 消息各生成一条独立 user 消息，遇到并行工具调用（assistant 一条消息里两个 `tool_use`）时，第二个 `tool_use` 后面不是它的 `tool_result`，上游直接 400：
+  `messages.1: tool_use ids were found without tool_result blocks immediately after: call_01_...`。
+  现在把连续的 `tool_result` 合并进**同一条** user 消息，并补两处兜底：
+  - 缺失的工具结果补 `is_error` 占位（历史压缩 / 中断导致结果丢失时不再断链）；
+  - 丢弃孤儿 `tool_result`（对应 `tool_use` 已不在历史里）。
+- `llm_client.dart` `_toAnthropicMessages`：带工具调用的 assistant 消息补 `thinking` 块（有真实思考用真实内容，否则用占位文本），修复严格通道的
+  `content[].thinking in the thinking mode must be passed back`。
+- `llm_client.dart` 新增 `_mergeAdjacentRoles`：Anthropic 要求 user / assistant 交替，历史里的连续同角色合成消息（归档确认、失败占位）合并成一条，`tool_result` 排最前。
+- `llm_client.dart` `_addResponsesReasoning`：Responses 通道在没有 `encrypted_content` 时，为带工具调用（或处于思考模式）的 assistant 消息补一条带 `summary` / `reasoning_text` 的思考条目，修复
+  `reasoning_text in the thinking mode must be passed back`。
+- 上述「伪造思考块 / 思考条目」只对**中转通道**生效：`baseUrl` 含 `anthropic.com` / `openai.com` 的官方端点不做伪造（官方端点严格校验签名与加密内容）。
+
+### 验证（真实中转通道，各 2 次）
+
+| Anthropic 通道探针 | 结果 |
+| --- | --- |
+| 两个 `tool_use`，工具结果拆成两条 user 消息 | 400（复现线上报错） |
+| 工具结果合并进同一条 user 消息 | 200 |
+| 合并 + 占位 `thinking` 块 | 200 |
+| 合并 + 无 `thinking` 块 | 200 |
+
+| Responses 通道探针 | 结果 |
+| --- | --- |
+| 带工具调用的 `function_call` 无思考条目 | 200 |
+| 补 `summary` / `reasoning_text` / 两者 | 200 |
+
+
 ## [未发布] 修复思考内容回传导致的 HTTP 400
 
 ### 修复

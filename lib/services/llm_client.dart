@@ -723,7 +723,7 @@ class LlmClient {
     return <String, dynamic>{
       'model': model,
       if (systemBlocks.isNotEmpty) 'system': systemBlocks,
-      'messages': _toAnthropicMessages(split.messages),
+      'messages': _toAnthropicMessages(split.messages, forceReasoning: thinkingOn),
       'max_tokens': maxTokens,
       'stream': stream,
       if (!thinkingOn) 'temperature': temperature,
@@ -750,7 +750,7 @@ class LlmClient {
   }) {
     final split = _splitSystems(messages);
     final effortField = _openAiReasoningEffort(reasoningEffort);
-    final input = _toResponsesInput(split.messages);
+    final input = _toResponsesInput(split.messages, forceReasoning: thinkingEnabled);
     if (split.tail.trim().isNotEmpty) {
       input.add({'type': 'message', 'role': 'system', 'content': split.tail});
     }
@@ -798,8 +798,9 @@ class LlmClient {
   }
 
   List<Map<String, dynamic>> _toResponsesInput(
-    List<Map<String, dynamic>> messages,
-  ) {
+    List<Map<String, dynamic>> messages, {
+    bool forceReasoning = false,
+  }) {
     final input = <Map<String, dynamic>>[];
     var assistantSeq = 0;
     for (final m in messages) {
@@ -814,7 +815,7 @@ class LlmClient {
       }
       final toolCalls = m['tool_calls'];
       if (role == 'assistant' && toolCalls is List && toolCalls.isNotEmpty) {
-        _addResponsesReasoning(input, m);
+        _addResponsesReasoning(input, m, forceReasoning: forceReasoning);
         final text = (m['content'] ?? '').toString();
         if (text.trim().isNotEmpty) {
           assistantSeq++;
@@ -841,7 +842,7 @@ class LlmClient {
         continue;
       }
       if (role == 'assistant') {
-        _addResponsesReasoning(input, m);
+        _addResponsesReasoning(input, m, forceReasoning: forceReasoning);
         assistantSeq++;
       }
       final resolvedRole = role.isEmpty ? 'user' : role;
@@ -859,13 +860,35 @@ class LlmClient {
     return input;
   }
 
-  static void _addResponsesReasoning(
+  /// Responses API 的思考条目：有加密内容时原样回放；没有加密内容但历史
+  /// 处于思考模式（或该轮带工具调用）时补一条带文本的思考条目——严格通道
+  /// 缺它会报 `reasoning_text in the thinking mode must be passed back`。
+  /// 官方端点不接受伪造条目，故只对中转通道生效。
+  void _addResponsesReasoning(
     List<Map<String, dynamic>> input,
-    Map<String, dynamic> message,
-  ) {
+    Map<String, dynamic> message, {
+    bool forceReasoning = false,
+  }) {
     final enc = (message['reasoning_encrypted'] ?? '').toString().trim();
-    if (enc.isEmpty) return;
-    input.add({'type': 'reasoning', 'encrypted_content': enc});
+    if (enc.isNotEmpty) {
+      input.add({'type': 'reasoning', 'encrypted_content': enc});
+      return;
+    }
+    if (baseUrl.contains('openai.com')) return;
+    final text = (message['reasoning_content'] ?? '').toString().trim();
+    final toolCalls = message['tool_calls'];
+    final hasTools = toolCalls is List && toolCalls.isNotEmpty;
+    if (text.isEmpty && !hasTools && !forceReasoning) return;
+    final body = text.isEmpty ? _reasoningPlaceholder : text;
+    input.add({
+      'type': 'reasoning',
+      'summary': [
+        {'type': 'summary_text', 'text': body},
+      ],
+      'content': [
+        {'type': 'reasoning_text', 'text': body},
+      ],
+    });
   }
 
   static Map<String, dynamic> _withoutResponsesOnlyFields(
@@ -1082,40 +1105,85 @@ class LlmClient {
     return !useMaxTokens;
   }
 
+  /// Anthropic 的硬性约束（实测确认）：
+  /// 1. 每个 `tool_use` 必须在**紧随其后**的同一条 user 消息里有对应
+  ///    `tool_result`；多个工具结果被拆成多条 user 消息会直接 400
+  ///    （`tool_use ids were found without tool_result blocks immediately after`）。
+  /// 2. 严格中转通道还要求带工具调用的 assistant 消息带 `thinking` 块，
+  ///    缺了报 `content[].thinking in the thinking mode must be passed back`。
+  /// 3. 角色必须交替，连续同角色消息会被拒。
   List<Map<String, dynamic>> _toAnthropicMessages(
-    List<Map<String, dynamic>> messages,
-  ) {
+    List<Map<String, dynamic>> messages, {
+    bool forceReasoning = false,
+  }) {
     final out = <Map<String, dynamic>>[];
+    var pending = <Map<String, dynamic>>[];
+    var expected = <String>[];
+
+    void flushToolResults() {
+      if (pending.isEmpty) return;
+      final kept = <Map<String, dynamic>>[];
+      for (final r in pending) {
+        final id = (r['tool_use_id'] ?? '').toString();
+        // 孤儿结果：对应的 tool_use 已不在历史里，Anthropic 会拒绝。
+        if (id.isEmpty || !expected.contains(id)) continue;
+        kept.add(r);
+      }
+      // 缺失的结果补占位，保证每个 tool_use 后面都有 tool_result。
+      for (final id in expected) {
+        final has = kept.any((r) => (r['tool_use_id'] ?? '').toString() == id);
+        if (!has) {
+          kept.add({
+            'type': 'tool_result',
+            'tool_use_id': id,
+            'content': '（该工具结果已在历史压缩或中断中移除）',
+            'is_error': true,
+          });
+        }
+      }
+      pending = <Map<String, dynamic>>[];
+      expected = <String>[];
+      if (kept.isEmpty) return;
+      out.add({'role': 'user', 'content': kept});
+    }
+
+    // 官方端点严格校验思考块签名，伪造会 400；中转通道相反，缺块反而必错。
+    final fabricate = !baseUrl.contains('anthropic.com');
     for (final m in messages) {
       final role = m['role'];
       if (role == 'tool') {
-        out.add({
-          'role': 'user',
-          'content': [
-            {
-              'type': 'tool_result',
-              'tool_use_id': (m['tool_call_id'] ?? '').toString(),
-              'content': (m['content'] ?? '').toString(),
-            },
-          ],
+        pending.add({
+          'type': 'tool_result',
+          'tool_use_id': (m['tool_call_id'] ?? '').toString(),
+          'content': (m['content'] ?? '').toString(),
         });
         continue;
       }
+      flushToolResults();
+      final reasoning = (m['reasoning_content'] ?? '').toString().trim();
       final toolCalls = m['tool_calls'];
       if (role == 'assistant' && toolCalls is List && toolCalls.isNotEmpty) {
         final content = <Map<String, dynamic>>[];
+        if (reasoning.isNotEmpty) {
+          content.add({'type': 'thinking', 'thinking': reasoning});
+        } else if (fabricate) {
+          content.add({'type': 'thinking', 'thinking': _reasoningPlaceholder});
+        }
         final text = (m['content'] ?? '').toString();
         if (text.trim().isNotEmpty) {
           content.add({'type': 'text', 'text': text});
         }
+        expected = <String>[];
         for (final raw in toolCalls) {
           final tc = raw is Map<String, dynamic> ? raw : <String, dynamic>{};
           final fn = tc['function'] is Map<String, dynamic>
               ? tc['function'] as Map<String, dynamic>
               : <String, dynamic>{};
+          final id = (tc['id'] ?? '').toString();
+          if (id.isNotEmpty) expected.add(id);
           content.add({
             'type': 'tool_use',
-            'id': (tc['id'] ?? '').toString(),
+            'id': id,
             'name': (fn['name'] ?? '').toString(),
             'input': _decodeArguments(fn['arguments']),
           });
@@ -1123,7 +1191,61 @@ class LlmClient {
         out.add({'role': 'assistant', 'content': content});
         continue;
       }
+      if (role == 'assistant') {
+        final content = <Map<String, dynamic>>[];
+        if (reasoning.isNotEmpty) {
+          content.add({'type': 'thinking', 'thinking': reasoning});
+        } else if (forceReasoning && fabricate) {
+          content.add({'type': 'thinking', 'thinking': _reasoningPlaceholder});
+        }
+        content.add({'type': 'text', 'text': (m['content'] ?? '').toString()});
+        out.add({'role': 'assistant', 'content': content});
+        continue;
+      }
       out.add({'role': role, 'content': (m['content'] ?? '').toString()});
+    }
+    flushToolResults();
+    return _mergeAdjacentRoles(out);
+  }
+
+  /// Anthropic 要求 user / assistant 交替；历史里出现连续同角色消息
+  /// （归档确认、失败占位等合成消息）时合并成一条，`tool_result` 排最前。
+  static List<Map<String, dynamic>> _mergeAdjacentRoles(
+    List<Map<String, dynamic>> items,
+  ) {
+    final out = <Map<String, dynamic>>[];
+    for (final m in items) {
+      if (out.isNotEmpty && out.last['role'] == m['role']) {
+        final prev = out.last;
+        final blocks = <Map<String, dynamic>>[];
+        for (final src in [prev, m]) {
+          final c = src['content'];
+          if (c is String) {
+            if (c.trim().isNotEmpty) blocks.add({'type': 'text', 'text': c});
+          } else if (c is List) {
+            for (final b in c) {
+              if (b is Map<String, dynamic>) blocks.add(b);
+            }
+          }
+        }
+        final results = blocks
+            .where((b) => b['type'] == 'tool_result')
+            .toList();
+        final rest = blocks.where((b) => b['type'] != 'tool_result').toList();
+        // 同一条消息里只保留一个 thinking 块。
+        var seenThinking = false;
+        final deduped = <Map<String, dynamic>>[];
+        for (final b in rest) {
+          if (b['type'] == 'thinking') {
+            if (seenThinking) continue;
+            seenThinking = true;
+          }
+          deduped.add(b);
+        }
+        prev['content'] = <Map<String, dynamic>>[...results, ...deduped];
+        continue;
+      }
+      out.add(m);
     }
     return out;
   }
