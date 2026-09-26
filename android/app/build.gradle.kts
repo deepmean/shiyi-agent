@@ -59,8 +59,9 @@ android {
         // sepolicy 补丁解决（见 TermuxRuntime._ensureApkLinkPolicy），
         // 无需再牺牲 targetSdk（新装 app 不再按旧版安卓设计渲染）。
         targetSdk = 36
-        versionCode = 31
-        versionName = "2.6.6"
+        // 版本号：CI 注入（github.run_number 自增，保证可覆盖安装），本地构建回退固定值。
+        versionCode = System.getenv("APP_VERSION_CODE")?.toIntOrNull() ?: 31
+        versionName = System.getenv("APP_VERSION_NAME") ?: "2.6.6"
         ndk {
             abiFilters.clear()
             abiFilters.add("arm64-v8a")
@@ -69,7 +70,11 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file("../../keystore.jks")
+            // 固定签名：keystore.p12 入库（openssl 生成的 PKCS12），密码走
+            // local.properties / 环境变量 KEYSTORE_PASSWORD。签名固定后可直接
+            // 覆盖安装，不再需要卸载重装。
+            storeFile = file("../../keystore.p12")
+            storeType = "PKCS12"
             storePassword = keystorePassword
             keyAlias = "shiyi"
             keyPassword = keystorePassword

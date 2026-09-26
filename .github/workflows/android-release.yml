@@ -16,8 +16,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # 构建期一次性自签密码：keystore 只在 CI 内生成，用完即弃。
-      KEYSTORE_PASSWORD: shiyi-ci-2026
+      # 固定签名（keystore.p12 已入库）：密码固定，签名跨构建一致。
+      KEYSTORE_PASSWORD: shiyi-keystore-2026
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,17 +37,6 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Generate CI signing keystore
-        run: |
-          keytool -genkeypair -v \
-            -keystore keystore.jks \
-            -storetype JKS \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias shiyi \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEYSTORE_PASSWORD" \
-            -dname "CN=ShiYi Agent CI, OU=CI, O=ShiYi, L=NA, ST=NA, C=CN"
-
       - name: Flutter pub get
         run: flutter pub get
 
@@ -56,6 +45,11 @@ jobs:
         run: |
           flutter analyze > analyze.log 2>&1 || true
           tail -n 60 analyze.log > analyze_tail.txt || true
+
+      - name: Compute app version
+        run: |
+          echo "APP_VERSION_CODE=$((1000 + ${GITHUB_RUN_NUMBER}))" >> "$GITHUB_ENV"
+          echo "APP_VERSION_NAME=2.6.6-headers.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Build release APK
         run: |
@@ -103,7 +97,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.6.6-custom-headers
-          name: "ShiYi Agent 2.6.6 arm64-v8a（自定义 HTTP Header 构建）"
+          name: "ShiYi Agent 2.6.6-headers.${{ github.run_number }} arm64-v8a（自定义 HTTP Header 构建）"
           body_path: release_body.md
           files: build/app/outputs/flutter-apk/app-release.apk
 

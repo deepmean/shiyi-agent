@@ -287,6 +287,7 @@ class LlmClient {
       var sendInclude = _isResponses;
       var thinkingEchoRetries = 0;
       var responses404Retries = 0;
+      var nodeRetries = 0;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
@@ -429,6 +430,22 @@ class LlmClient {
             if (_isThinkingEchoRequired(err) && thinkingEchoRetries < 2) {
               thinkingEchoRetries++;
               onDiag?.call('[stream] 思考回传被拒，重试（节点抖动）');
+              continue;
+            }
+            // 中转多节点轮询：节点宕机/边缘 WAF 会返回 405/5xx，
+            // 同一 body 重试常能落到健康节点（实测 405、503 都出现过）。
+            if (_isRelayChannel &&
+                nodeRetries < 2 &&
+                (response.statusCode == 405 ||
+                    response.statusCode == 500 ||
+                    response.statusCode == 502 ||
+                    response.statusCode == 503 ||
+                    response.statusCode == 504)) {
+              nodeRetries++;
+              onDiag?.call(
+                '[stream] 节点异常 HTTP ${response.statusCode}，重试（节点抖动）',
+              );
+              await Future.delayed(const Duration(milliseconds: 300));
               continue;
             }
             // Responses 端点在部分中转上只有少数节点实现：404 重试一次。
