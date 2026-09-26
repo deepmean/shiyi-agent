@@ -26,6 +26,10 @@ class LlmErrorInfo {
   final String parameter;
   final LlmErrorKind kind;
 
+  /// 可操作的排查建议（例如「请新建会话」）。上游返回的英文 400 往往只说明
+  /// 现象不说原因，补一句中文指引能省掉一整轮试错。
+  final String hint;
+
   const LlmErrorInfo({
     required this.statusCode,
     required this.providerCode,
@@ -33,6 +37,7 @@ class LlmErrorInfo {
     required this.providerMessage,
     required this.parameter,
     required this.kind,
+    this.hint = '',
   });
 
   factory LlmErrorInfo.fromHttp(int statusCode, String rawBody) {
@@ -106,8 +111,21 @@ class LlmErrorInfo {
         ? '，类型 $providerType'
         : '';
     final param = parameter.isNotEmpty ? '，参数 $parameter' : '';
-    return 'HTTP $statusCode：$meaning$code$param。${providerMessage.trim()}';
+    final extra = hint.trim().isEmpty ? '' : ' ${hint.trim()}';
+    return 'HTTP $statusCode：$meaning$code$param。'
+        '${providerMessage.trim()}$extra';
   }
+
+  /// 复制一份并附加可操作建议。
+  LlmErrorInfo withHint(String value) => LlmErrorInfo(
+    statusCode: statusCode,
+    providerCode: providerCode,
+    providerType: providerType,
+    providerMessage: providerMessage,
+    parameter: parameter,
+    kind: kind,
+    hint: value,
+  );
 
   Map<String, dynamic> toLogData() => {
     'statusCode': statusCode,

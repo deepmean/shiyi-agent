@@ -365,6 +365,32 @@ class LlmClient {
             );
             // 思考参数被网关拒绝：先分别去掉不兼容字段重试。
             final e = err.toLowerCase();
+            // DeepSeek V4 思考模式强制校验（官方 thinking_mode 文档）：
+            // 会话里模型一旦发生过工具调用，后续请求必须回传历史 assistant
+            // 消息的 reasoning_content，否则整轮 400。历史里只要混入了没有
+            // 思考内容的助手消息（压缩摘要、失败占位、其他厂商模型产生的
+            // 轮次），就无法凭空补出思考内容，只能按官方备选方案关闭思考。
+            // 这里一次性关掉 thinking 与 reasoning_effort，避免两轮才降完；
+            // 关思考后仍报同样错误说明历史确实缺思考内容，直接给出可操作
+            // 提示，而不是把一段英文 400 原样抛给用户。
+            if (_isThinkingEchoRequired(err)) {
+              if (thinkingEnabled ||
+                  (reasoningEffort != null && reasoningEffort != 'off')) {
+                thinkingEnabled = false;
+                reasoningEffort = null;
+                onDiag?.call('[stream] 网关要求回传思考内容，关闭思考模式后重试');
+                continue;
+              }
+              throw LlmHttpException(
+                LlmErrorInfo.fromHttp(response.statusCode, err).withHint(
+                  '该网关启用了思考模式强制校验：模型发生过工具调用的会话，'
+                  '后续请求必须回传历史中的思考内容，而当前历史里有缺少'
+                  '思考内容的助手消息（摘要、占位或中途换过模型）。'
+                  '请新建会话重试，或把思考强度设为「关闭」。',
+                ),
+                err,
+              );
+            }
             if (useMaxCompletion && e.contains('max_completion_tokens')) {
               useMaxCompletion = false;
               onDiag?.call('[stream] max_completion_tokens 被拒绝，回退 max_tokens');
@@ -1055,12 +1081,16 @@ class LlmClient {
     for (final m in messages) {
       final role = m['role'];
       if (role == 'tool') {
+        final toolUseId = (m['tool_call_id'] ?? '').toString();
+        // tool_call_id 为空的历史脏数据无法配对，直接丢弃该结果块，
+        // 否则上游报 unexpected tool_result。
+        if (toolUseId.isEmpty) continue;
         out.add({
           'role': 'user',
           'content': [
             {
               'type': 'tool_result',
-              'tool_use_id': (m['tool_call_id'] ?? '').toString(),
+              'tool_use_id': toolUseId,
               'content': (m['content'] ?? '').toString(),
             },
           ],
@@ -1079,19 +1109,107 @@ class LlmClient {
           final fn = tc['function'] is Map<String, dynamic>
               ? tc['function'] as Map<String, dynamic>
               : <String, dynamic>{};
+          final id = (tc['id'] ?? '').toString();
+          // 空 id 的 tool_use 无法与任何 tool_result 配对，跳过而不是
+          // 下发一个必然被拒的块。
+          if (id.isEmpty) continue;
           content.add({
             'type': 'tool_use',
-            'id': (tc['id'] ?? '').toString(),
+            'id': id,
             'name': (fn['name'] ?? '').toString(),
             'input': _decodeArguments(fn['arguments']),
           });
         }
+        if (content.isEmpty) continue;
         out.add({'role': 'assistant', 'content': content});
         continue;
       }
       out.add({'role': role, 'content': (m['content'] ?? '').toString()});
     }
+    return _repairAnthropicToolPairs(out);
+  }
+
+  /// Anthropic 对工具配对有硬校验：每个 tool_use 之后必须紧跟包含对应
+  /// tool_result 的消息，否则整轮 400（`messages.N: tool_use ids were found
+  /// without tool_result blocks immediately after`）。历史压缩、工具结果被
+  /// 裁掉、续写中断都会造成断链；这里补齐缺失的 tool_result 占位，并丢弃
+  /// 已经没有对应 tool_use 的孤儿结果块。
+  static List<Map<String, dynamic>> _repairAnthropicToolPairs(
+    List<Map<String, dynamic>> messages,
+  ) {
+    final out = <Map<String, dynamic>>[];
+    final knownToolUseIds = <String>{};
+    for (var i = 0; i < messages.length; i++) {
+      final m = messages[i];
+      final resultIds = _toolResultIdsOf(m);
+      if (resultIds.isNotEmpty) {
+        final kept = resultIds.where(knownToolUseIds.contains).toSet();
+        if (kept.isEmpty) continue;
+        if (kept.length == resultIds.length) {
+          out.add(m);
+        } else {
+          out.add({
+            'role': 'user',
+            'content': [
+              for (final b in (m['content'] as List))
+                if (b is Map &&
+                    b['type'] == 'tool_result' &&
+                    kept.contains((b['tool_use_id'] ?? '').toString()))
+                  b,
+            ],
+          });
+        }
+        continue;
+      }
+      out.add(m);
+      final toolUseIds = _toolUseIdsOf(m);
+      if (toolUseIds.isEmpty) continue;
+      knownToolUseIds.addAll(toolUseIds);
+      final answered = <String>{};
+      var j = i + 1;
+      while (j < messages.length) {
+        final next = _toolResultIdsOf(messages[j]);
+        if (next.isEmpty) break;
+        answered.addAll(next);
+        j++;
+      }
+      final missing = toolUseIds
+          .where((id) => !answered.contains(id))
+          .toList(growable: false);
+      if (missing.isEmpty) continue;
+      out.add({
+        'role': 'user',
+        'content': [
+          for (final id in missing)
+            {
+              'type': 'tool_result',
+              'tool_use_id': id,
+              'content': '[工具结果缺失：该结果在历史压缩或中断中已被移除]',
+              'is_error': true,
+            },
+        ],
+      });
+    }
     return out;
+  }
+
+  static List<String> _toolUseIdsOf(Map<String, dynamic> m) {
+    final content = m['content'];
+    if (m['role'] != 'assistant' || content is! List) return const <String>[];
+    return [
+      for (final b in content)
+        if (b is Map && b['type'] == 'tool_use') (b['id'] ?? '').toString(),
+    ];
+  }
+
+  static List<String> _toolResultIdsOf(Map<String, dynamic> m) {
+    final content = m['content'];
+    if (m['role'] != 'user' || content is! List) return const <String>[];
+    return [
+      for (final b in content)
+        if (b is Map && b['type'] == 'tool_result')
+          (b['tool_use_id'] ?? '').toString(),
+    ];
   }
 
   Map<String, dynamic> _decodeArguments(Object? raw) {
@@ -1125,6 +1243,19 @@ class LlmClient {
 
   /// MiMo 等网关拒绝未知字段时只回 `Invalid request parameters`，
   /// 不点名 `reasoning_effort`。有思考档位时按该字段被拒处理。
+  /// 「思考内容必须回传」错误族：DeepSeek V4 思考模式下，模型一旦发生
+  /// 工具调用，后续请求必须携带历史 assistant 的 reasoning_content。
+  /// 三种协议的报错文案不同（openai 的 reasoning_content、responses 的
+  /// reasoning_text、anthropic 的 content[].thinking），判定统一走这里。
+  static bool _isThinkingEchoRequired(String err) {
+    final e = err.toLowerCase();
+    if (!e.contains('must be passed back')) return false;
+    return e.contains('reasoning_content') ||
+        e.contains('reasoning_text') ||
+        e.contains('thinking') ||
+        e.contains('reasoning');
+  }
+
   static bool _isVagueInvalidRequest(String err) {
     final e = err.toLowerCase();
     return e.contains('invalid request parameters') ||
