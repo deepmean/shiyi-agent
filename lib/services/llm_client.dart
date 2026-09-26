@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -64,6 +65,10 @@ class LlmClient {
   final void Function(String error)? onError;
   final bool Function()? shouldStop;
 
+  /// 自定义 / 伪装请求头（设置页预设 + 自定义项）。
+  /// 同名覆盖默认头，Content-Type 除外；值支持 {{session_id}} / {{uuid}}。
+  final Map<String, String> customHeaders;
+
   /// 拾忆主会话的显式思考强度；null 表示沿用模型默认推断。
   /// 该字段不承载 DSH 的会话模型协议。
   final String? reasoningEffortOverride;
@@ -121,6 +126,7 @@ class LlmClient {
     this.shouldStop,
     this.reasoningEffortOverride,
     this.onDiag,
+    this.customHeaders = const {},
   });
 
   bool get _isResponses => protocol == 'responses';
@@ -169,15 +175,52 @@ class LlmClient {
     return root;
   }
 
-  Map<String, String> _headers({required bool streaming}) => <String, String>{
-    'Content-Type': 'application/json',
-    if (streaming) 'Accept': 'text/event-stream',
-    if (apiKey.isNotEmpty && protocol != 'anthropic')
-      'Authorization': 'Bearer $apiKey',
-    if (apiKey.isNotEmpty && protocol == 'anthropic') 'x-api-key': apiKey,
-    if (protocol == 'anthropic') 'anthropic-version': '2023-06-01',
-    if (protocol == 'anthropic') 'anthropic-beta': 'prompt-caching-2024-07-31',
-  };
+  Map<String, String> _headers({required bool streaming}) {
+    final headers = <String, String>{
+      'Content-Type': 'application/json',
+      if (streaming) 'Accept': 'text/event-stream',
+      if (apiKey.isNotEmpty && protocol != 'anthropic')
+        'Authorization': 'Bearer $apiKey',
+      if (apiKey.isNotEmpty && protocol == 'anthropic') 'x-api-key': apiKey,
+      if (protocol == 'anthropic') 'anthropic-version': '2023-06-01',
+      if (protocol == 'anthropic')
+        'anthropic-beta': 'prompt-caching-2024-07-31',
+    };
+    if (customHeaders.isEmpty) return headers;
+    customHeaders.forEach((name, value) {
+      final key = name.trim();
+      if (key.isEmpty) return;
+      // Content-Type 是协议关键头，不允许被覆盖。
+      if (key.toLowerCase() == 'content-type') return;
+      headers.removeWhere((k, _) => k.toLowerCase() == key.toLowerCase());
+      final resolved = _resolveHeaderValue(value);
+      if (resolved.isEmpty) return; // 空值 = 删除该头
+      headers[key] = resolved;
+    });
+    return headers;
+  }
+
+  /// 请求头占位符替换：{{session_id}} 用当前会话 id，{{uuid}} 用本客户端随机 id。
+  String _resolveHeaderValue(String value) {
+    if (!value.contains('{{')) return value;
+    final sid = sessionId.trim().isEmpty ? _clientUuid : sessionId.trim();
+    return value
+        .replaceAll('{{session_id}}', sid)
+        .replaceAll('{{uuid}}', _clientUuid);
+  }
+
+  /// 本客户端实例的随机 UUID（模拟 Codex / Claude Code 的会话标识）。
+  late final String _clientUuid = _generateUuidV4();
+
+  static String _generateUuidV4() {
+    final rnd = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+        '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  }
 
   /// 续写指令：上一轮只输出了计划且没有实际工具调用时，改用“工具唤醒”提示，
   /// 避免模型把“继续写文字”理解成继续描述计划而不是执行工具。

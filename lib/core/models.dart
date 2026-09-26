@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'http_headers.dart';
+
 /// 设置页允许的会话上下文 token 范围（默认 128k，最高 200 万）。
 const int kDefaultContextLimit = 128000;
 const int kMinContextLimit = 1000;
@@ -718,6 +720,12 @@ class AppSettings {
   List<Socks5Server> socks5Servers;
   String socks5ActiveId;
 
+  /// 客户端身份伪装预设：none / hermes / codex / claudeCode，见 [httpHeaderPresets]。
+  String headerPreset;
+
+  /// 自定义 HTTP 请求头；同名覆盖预设与默认头（Content-Type 除外）。
+  Map<String, String> customHeaders;
+
   AppSettings({
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
@@ -769,6 +777,8 @@ class AppSettings {
     this.socks5Password = '',
     this.socks5Servers = const [],
     this.socks5ActiveId = '',
+    this.headerPreset = kHeaderPresetNone,
+    this.customHeaders = const {},
   });
 
   AppSettings copyWith({
@@ -822,6 +832,8 @@ class AppSettings {
     String? socks5Password,
     List<Socks5Server>? socks5Servers,
     String? socks5ActiveId,
+    String? headerPreset,
+    Map<String, String>? customHeaders,
   }) => AppSettings(
     baseUrl: baseUrl ?? this.baseUrl,
     apiKey: apiKey ?? this.apiKey,
@@ -874,7 +886,13 @@ class AppSettings {
     socks5Password: socks5Password ?? this.socks5Password,
     socks5Servers: socks5Servers ?? this.socks5Servers,
     socks5ActiveId: socks5ActiveId ?? this.socks5ActiveId,
+    headerPreset: headerPreset ?? this.headerPreset,
+    customHeaders: customHeaders ?? this.customHeaders,
   );
+
+  /// 预设 + 自定义头合并后的实际请求头（自定义优先，空值表示删除该头）。
+  Map<String, String> get effectiveCustomHeaders =>
+      mergeCustomHeaders(headerPreset, customHeaders);
 
   Map<String, dynamic> toJson() => {
     'baseUrl': baseUrl,
@@ -925,6 +943,8 @@ class AppSettings {
     'socks5User': socks5User,
     'socks5Servers': socks5Servers.map((e) => e.toJson()).toList(),
     'socks5ActiveId': socks5ActiveId,
+    'headerPreset': headerPreset,
+    'customHeaders': customHeaders,
   };
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
@@ -981,6 +1001,8 @@ class AppSettings {
     socks5Password: j['socks5Password'] ?? '',
     socks5Servers: _socks5ServersFromJson(j['socks5Servers']),
     socks5ActiveId: j['socks5ActiveId'] ?? '',
+    headerPreset: _headerPresetFromJson(j['headerPreset']),
+    customHeaders: _stringMapFromJson(j['customHeaders']),
   );
 }
 
@@ -1017,6 +1039,23 @@ String _socks5ModeFromJson(Map<String, dynamic> j) {
   if (raw == 'off' || raw == 'auto' || raw == 'custom') return raw;
   if (j['socks5Enabled'] == true) return 'custom';
   return 'off';
+}
+
+String _headerPresetFromJson(dynamic raw) {
+  final value = (raw ?? '').toString().trim();
+  return httpHeaderPresetById(value)?.id ?? kHeaderPresetNone;
+}
+
+/// 自定义请求头反序列化：丢掉空键，值统一转字符串。
+Map<String, String> _stringMapFromJson(dynamic raw) {
+  if (raw is! Map) return const {};
+  final out = <String, String>{};
+  raw.forEach((k, v) {
+    final key = k.toString().trim();
+    if (key.isEmpty) return;
+    out[key] = v?.toString() ?? '';
+  });
+  return out;
 }
 
 List<Socks5Server> _socks5ServersFromJson(dynamic raw) {

@@ -2653,6 +2653,7 @@ class ShiyiState extends ChangeNotifier {
           protocol: 'openai',
           temperature: 0.2,
           tools: const [],
+          customHeaders: settings.effectiveCustomHeaders,
         );
         desc = (await client.completeOne(
           [
@@ -3693,6 +3694,7 @@ class ShiyiState extends ChangeNotifier {
       temperature: settings.temperature,
       maxTokens: settings.maxOutputTokens,
       tools: _activeToolsFor(planMode: run.planMode),
+      customHeaders: clientSettings.effectiveCustomHeaders,
       reasoningEffortOverride: run.thinkingOn ? run.reasoningEffort : 'off',
       shouldStop: () => run.stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
@@ -4756,6 +4758,7 @@ class ShiyiState extends ChangeNotifier {
           protocol: clientSettings.apiProtocol,
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
+          customHeaders: clientSettings.effectiveCustomHeaders,
           toolsJson: _toolsJsonFor(def.allowedTools),
           // 子代理上下文预算：主会话 contextLimit 的 75%（留出输出与工具定义空间）。
           contextBudgetTokens: parentLimit > 0 ? (parentLimit * 3) ~/ 4 : 0,
@@ -5210,6 +5213,7 @@ class ShiyiState extends ChangeNotifier {
       protocol: clientSettings.apiProtocol,
       temperature: 0.2,
       tools: _activeToolsFor(planMode: planModeForSession(sessionId)),
+      customHeaders: clientSettings.effectiveCustomHeaders,
     );
     final summary = await client.completeOne(compactMsgs, temperature: 0.2);
     final clean = summary.trim();
@@ -5425,6 +5429,7 @@ class ShiyiState extends ChangeNotifier {
         protocol: refineSettings.apiProtocol,
         temperature: 0.2,
         tools: const [],
+        customHeaders: refineSettings.effectiveCustomHeaders,
       );
       final result = await client.completeOne([
         {

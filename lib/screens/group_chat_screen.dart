@@ -418,6 +418,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
           tools: tools,
+          customHeaders: settings.effectiveCustomHeaders,
           reasoningEffortOverride: _thinkingOn
               ? ReasoningModels.defaultEffort(model)
               : 'off',
@@ -1009,6 +1010,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       temperature: widget.shiyi.settings.temperature,
       maxTokens: widget.shiyi.settings.maxOutputTokens,
       tools: const [],
+      customHeaders: widget.shiyi.settings.effectiveCustomHeaders,
       reasoningEffortOverride: 'off',
       shouldStop: () => _activeRun.stopRequested,
       onTurn: (turn) => summary = turn.text,

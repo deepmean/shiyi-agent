@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/app_state.dart';
+import '../core/http_headers.dart';
 import '../core/mac_page_route.dart';
 import '../core/model_presets.dart';
 import '../core/models.dart';
@@ -23,6 +24,7 @@ import '../widgets/ios_style.dart';
 import '../widgets/laap_service_panel.dart';
 import 'about_screen.dart';
 import 'dsh_center_screen.dart';
+import 'http_header_screen.dart';
 import 'log_screen.dart';
 
 const _iosBlue = Color(0xFF0A84FF);
@@ -416,6 +418,13 @@ Widget _navTile({
     trailing: const CupertinoListTileChevron(),
     onTap: onTap,
   );
+}
+
+/// 自定义 Header 入口副标题：当前身份预设 + 自定义条数。
+String _headerSubtitle(AppSettings s) {
+  final label = httpHeaderPresetLabel(s.headerPreset);
+  final extra = s.customHeaders.length;
+  return extra == 0 ? label : '$label · 自定义 $extra 条';
 }
 
 String _shortUrl(String url) {
@@ -1258,6 +1267,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
             protocol: _protocol,
             temperature: 0,
             tools: const [],
+            customHeaders: widget.shiyi.settings.effectiveCustomHeaders,
           );
           return client.listModels();
         },
@@ -1307,6 +1317,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
             protocol: _protocol,
             temperature: 0,
             tools: const [],
+            customHeaders: widget.shiyi.settings.effectiveCustomHeaders,
           );
           return client.testChat();
         },
@@ -1374,6 +1385,16 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
               controller: _modelCtrl,
               placeholder: '例如 deepseek-chat',
               onChanged: (_) => _save.schedule(),
+            ),
+            _navTile(
+              icon: CupertinoIcons.arrow_left_right,
+              color: _iosPurple,
+              title: '自定义 HTTP Header',
+              subtitle: _headerSubtitle(widget.shiyi.settings),
+              onTap: () => _open(
+                context,
+                HttpHeaderScreen(shiyi: widget.shiyi),
+              ),
             ),
           ],
         ),

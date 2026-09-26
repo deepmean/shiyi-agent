@@ -278,6 +278,9 @@ class SubagentRunner {
   /// 允许的工具 JSON 列表（已按白名单过滤，模型只能调这些）。
   final List<Map<String, dynamic>> toolsJson;
 
+  /// 自定义 / 伪装请求头，与主会话保持一致。
+  final Map<String, String> customHeaders;
+
   /// 执行工具的回调（复用主循环的 _executeTool）。
   final Future<String> Function(String name, String argsJson) executeTool;
 
@@ -330,6 +333,7 @@ class SubagentRunner {
     required this.temperature,
     this.maxTokens = 8192,
     required this.toolsJson,
+    this.customHeaders = const {},
     required this.executeTool,
     required this.workingDir,
     this.shouldStop,
@@ -522,6 +526,7 @@ class SubagentRunner {
       temperature: temperature,
       maxTokens: maxTokens,
       tools: toolsJson,
+      customHeaders: customHeaders,
       shouldStop: shouldStop,
       onTurn: (t) {
         accumulated = t;
